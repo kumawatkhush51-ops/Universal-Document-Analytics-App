@@ -344,16 +344,67 @@ def extract_docx(raw):
     return "\n".join(parts)
 
 
+def read_excel_robust(raw, filename):
+    """Read Excel files reliably in both local and Streamlit Cloud environments.
+
+    Some workbooks do not identify their engine cleanly, and files created by
+    different Excel-compatible programs can have unusual metadata. We try the
+    correct engine first and then a safe fallback instead of failing immediately.
+    """
+    lower_name = filename.lower()
+    errors = []
+
+    # .xlsx / .xlsm are ZIP-based Office Open XML files.
+    if lower_name.endswith((".xlsx", ".xlsm")):
+        for engine in ("openpyxl", "xlrd"):
+            try:
+                df = pd.read_excel(io.BytesIO(raw), engine=engine)
+                return normalize_table(df)
+            except Exception as exc:
+                errors.append(f"{engine}: {exc}")
+
+    # Legacy .xls files require xlrd.
+    if lower_name.endswith(".xls"):
+        try:
+            df = pd.read_excel(io.BytesIO(raw), engine="xlrd")
+            return normalize_table(df)
+        except Exception as exc:
+            errors.append(f"xlrd: {exc}")
+
+        # A few files are incorrectly named .xls but are actually .xlsx.
+        try:
+            df = pd.read_excel(io.BytesIO(raw), engine="openpyxl")
+            return normalize_table(df)
+        except Exception as exc:
+            errors.append(f"openpyxl fallback: {exc}")
+
+    details = " | ".join(errors[-2:])
+    raise ValueError(
+        "This Excel workbook could not be read. It may be damaged, password protected, "
+        "or saved with an incorrect Excel extension. Open it in Excel and use "
+        "Save As → Excel Workbook (.xlsx), then upload the saved copy."
+        + (f" Technical details: {details}" if details else "")
+    )
+
+
 def read_uploaded_file(uploaded_file):
     """Read supported files and return kind, dataframe, text."""
     name = uploaded_file.name.lower()
     raw = uploaded_file.getvalue()
 
-    if name.endswith(".csv"):
-        return "table", normalize_table(pd.read_csv(io.BytesIO(raw))), ""
+    if not raw:
+        raise ValueError("The uploaded file is empty.")
 
-    if name.endswith((".xlsx", ".xls")):
-        return "table", normalize_table(pd.read_excel(io.BytesIO(raw))), ""
+    if name.endswith(".csv"):
+        # utf-8 first, then common Windows encoding.
+        try:
+            df = pd.read_csv(io.BytesIO(raw), encoding="utf-8-sig")
+        except UnicodeDecodeError:
+            df = pd.read_csv(io.BytesIO(raw), encoding="cp1252")
+        return "table", normalize_table(df), ""
+
+    if name.endswith((".xlsx", ".xls", ".xlsm")):
+        return "table", read_excel_robust(raw, name), ""
 
     if name.endswith(".json"):
         text = raw.decode("utf-8", errors="replace")
@@ -1171,6 +1222,7 @@ with st.sidebar:
         type=[
             "xlsx",
             "xls",
+            "xlsm",
             "csv",
             "json",
             "pdf",
@@ -1178,7 +1230,7 @@ with st.sidebar:
             "txt",
         ],
         help=(
-            "Supported: Excel, CSV, JSON, PDF, Word and TXT."
+            "Supported: Excel (.xlsx/.xls/.xlsm), CSV, JSON, PDF, Word and TXT."
         ),
     )
 
@@ -1197,11 +1249,15 @@ with st.sidebar:
 
             st.success("File loaded successfully.")
 
-        except Exception:
+        except Exception as exc:
             st.error(
-                "We could not read this file. "
-                "Please check that it is not damaged or password protected."
+                "We could not read this file. If it is an Excel file, open it in Excel "
+                "and use Save As → Excel Workbook (.xlsx), then upload the saved copy."
             )
+            # Keep technical details out of the main dashboard, but make them available
+            # for troubleshooting when a deployment has a genuinely unusual file.
+            with st.expander("Show troubleshooting details"):
+                st.code(str(exc))
 
     if st.session_state.file_name:
         st.divider()
@@ -1245,6 +1301,7 @@ if not st.session_state.file_name:
 
             - Excel `.xlsx`
             - Excel `.xls`
+            - Excel `.xlsm`
             - CSV `.csv`
             - JSON `.json`
             """
